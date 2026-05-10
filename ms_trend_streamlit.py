@@ -37,7 +37,7 @@ from datetime import datetime, timezone, timedelta
 #  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 SYMBOLS         = ["BTCUSD", "ETHUSD"]
-RESOLUTION      = "5m"
+RESOLUTION      = "15m"
 REFRESH_SECONDS = 5
 LOOKBACK_BARS   = 3000   # enough history for indicator state to converge to TradingView's value
 
@@ -46,8 +46,9 @@ ATR_LENGTH       = 14
 ATR_MULT         = 4.0
 TARGET_STEP_MULT = 2.0
 
-# Per-symbol simulated trade rules (in price points)
-TRADE_RULES = {
+# Per-symbol simulated trade rules (in price points) — these are the DEFAULTS.
+# Live values are stored in st.session_state.trade_rules so they can be edited from the UI.
+DEFAULT_TRADE_RULES = {
     "BTCUSD": {"target": 30, "stop": 40},
     "ETHUSD": {"target": 3,  "stop": 10},
 }
@@ -147,12 +148,19 @@ def ms_trend_matrix(df, ms_len=MS_LEN, atr_length=ATR_LENGTH,
     pl_at = np.full(n, np.nan)
     last_ph = last_pl = np.nan
     for i in range(ms_len, n - ms_len):
-        win_h = high[i - ms_len: i + ms_len + 1]
-        win_l = low [i - ms_len: i + ms_len + 1]
+        left_h  = high[i - ms_len: i]
+        right_h = high[i + 1: i + ms_len + 1]
+        left_l  = low [i - ms_len: i]
+        right_l = low [i + 1: i + ms_len + 1]
         confirm = i + ms_len
-        if high[i] == win_h.max() and (win_h == high[i]).sum() == 1:
+
+        # Pine's ta.pivothigh: center >= all neighbors, strictly > at least one
+        if (high[i] >= left_h.max() and high[i] >= right_h.max()
+                and (high[i] > left_h.min() or high[i] > right_h.min())):
             last_ph = high[i]
-        if low[i]  == win_l.min() and (win_l == low[i]).sum() == 1:
+        # Pine's ta.pivotlow: center <= all neighbors, strictly < at least one
+        if (low[i] <= left_l.min() and low[i] <= right_l.min()
+                and (low[i] < left_l.max() or low[i] < right_l.max())):
             last_pl = low[i]
         ph_at[confirm] = last_ph
         pl_at[confirm] = last_pl
@@ -213,9 +221,9 @@ DIR_NAME  = {1: "LONG", -1: "SHORT", 0: "FLAT"}
 DIR_EMOJI = {1: "🟢 LONG", -1: "🔴 SHORT", 0: "⚪ FLAT"}
 
 
-def open_trade(symbol, direction, spot, ts):
-    """Build a new trade dict at the moment of a flip."""
-    rules = TRADE_RULES[symbol]
+def open_trade(symbol, direction, spot, ts, rules):
+    """Build a new trade dict at the moment of a flip.
+    `rules` is the per-symbol dict {target, stop} from session_state."""
     if direction == 1:      # LONG
         target = spot + rules["target"]
         stop   = spot - rules["stop"]
@@ -316,6 +324,9 @@ if "baseline_set"     not in st.session_state: st.session_state.baseline_set = F
 if "last_refresh"     not in st.session_state: st.session_state.last_refresh = None
 if "errors"           not in st.session_state: st.session_state.errors = {}
 if "current_state"    not in st.session_state: st.session_state.current_state = {}
+if "trade_rules"      not in st.session_state: st.session_state.trade_rules = {
+    s: dict(DEFAULT_TRADE_RULES[s]) for s in SYMBOLS
+}
 
 # Header
 st.title("📈 MS Trend Matrix [BigBeluga] — Live Signal Tracker")
@@ -340,11 +351,30 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📐 Trade rules (points)")
-    rules_df = pd.DataFrame([
-        {"Symbol": s, "Target (+)": TRADE_RULES[s]["target"], "Stop (−)": TRADE_RULES[s]["stop"]}
-        for s in SYMBOLS
-    ])
-    st.dataframe(rules_df, hide_index=True, use_container_width=True)
+    st.caption("Adjust target/stop in price points. Changes apply to NEW trades; "
+               "trades already open keep their original TP/SL.")
+    for sym in SYMBOLS:
+        st.markdown(f"**{sym}**")
+        c_t, c_s = st.columns(2)
+        with c_t:
+            new_target = st.number_input(
+                f"Target ({sym})",
+                min_value=0.1, step=0.1,
+                value=float(st.session_state.trade_rules[sym]["target"]),
+                key=f"tgt_{sym}",
+                label_visibility="collapsed",
+            )
+            st.caption("🎯 Target +")
+        with c_s:
+            new_stop = st.number_input(
+                f"Stop ({sym})",
+                min_value=0.1, step=0.1,
+                value=float(st.session_state.trade_rules[sym]["stop"]),
+                key=f"stp_{sym}",
+                label_visibility="collapsed",
+            )
+            st.caption("🛑 Stop −")
+        st.session_state.trade_rules[sym] = {"target": new_target, "stop": new_stop}
 
     st.divider()
     # CSV download — works regardless of filesystem persistence
@@ -433,7 +463,8 @@ for sym in SYMBOLS:
             st.session_state.open_trade[sym] = None
 
         # Open a fresh trade
-        new_trade = open_trade(sym, new_dir, spot, now_ist)
+        new_trade = open_trade(sym, new_dir, spot, now_ist,
+                               st.session_state.trade_rules[sym])
         if new_trade is not None:
             st.session_state.trades.append(new_trade)
             st.session_state.open_trade[sym] = new_trade
@@ -458,6 +489,40 @@ for i, sym in enumerate(SYMBOLS):
             delta=f"{DIR_EMOJI[s['direction']]}",
         )
         st.caption(f"Last bar close: ${s['bar_close']:,.2f}  ·  {to_ist_str(s['bar_time'])}")
+
+
+# ─── Live open-trade monitor (TP/SL distance from current spot) ─────────────
+open_trades_now = [t for t in st.session_state.trades if t["status"] == "OPEN"]
+if open_trades_now:
+    st.subheader("⚡ Live open trades (checked every refresh)")
+    rows = []
+    for t in open_trades_now:
+        sym = t["symbol"]
+        cur_spot = state.get(sym, {}).get("spot")
+        if cur_spot is None:
+            continue
+        d = t["direction"]
+        # Distance to TP and SL in points (positive = still on right side)
+        if d == 1:
+            dist_to_tp = t["target"] - cur_spot
+            dist_to_sl = cur_spot - t["stop"]
+        else:
+            dist_to_tp = cur_spot - t["target"]
+            dist_to_sl = t["stop"] - cur_spot
+        unrealized = (cur_spot - t["entry"]) * d
+        rows.append({
+            "Symbol":    sym,
+            "Side":      DIR_NAME[d],
+            "Entry":     round(t["entry"], 2),
+            "Current":   round(cur_spot, 2),
+            "Target":    round(t["target"], 2),
+            "Stop":      round(t["stop"], 2),
+            "Unrealized (pts)": round(unrealized, 2),
+            "Pts to target":    round(dist_to_tp, 2),
+            "Pts to stop":      round(dist_to_sl, 2),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
 # ─── Diagnostic: recent flips per symbol (cross-check against TradingView) ───
