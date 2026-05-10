@@ -37,7 +37,7 @@ from datetime import datetime, timezone, timedelta
 #  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 SYMBOLS                = ["BTCUSD", "ETHUSD"]
-DEFAULT_RESOLUTION     = "15m"   # changeable in UI
+DEFAULT_RESOLUTION     = "5m"   # changeable in UI
 DEFAULT_REFRESH_SEC    = 10      # changeable in UI
 LOOKBACK_BARS          = 3000
 
