@@ -37,7 +37,7 @@ from datetime import datetime, timezone, timedelta
 #  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 SYMBOLS         = ["BTCUSD", "ETHUSD"]
-RESOLUTION      = "15m"
+RESOLUTION      = "5m"
 REFRESH_SECONDS = 5
 LOOKBACK_BARS   = 3000   # enough history for indicator state to converge to TradingView's value
 
