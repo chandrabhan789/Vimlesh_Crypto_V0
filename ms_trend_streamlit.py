@@ -248,10 +248,18 @@ def analyze(symbol, resolution):
     last = out.iloc[-1]
     spot = fetch_spot_price(symbol)
 
-    # Stochastic RSI on the same closed-bar series
-    k_series, d_series = stoch_rsi_k(out["close"].to_numpy())
+    # ── StochRSI on closed bars + the live in-progress bar (current spot) ──
+    # Direction stays based on closed bars only (no flicker). But for StochRSI,
+    # we want it to react to the live spot like TradingView does — so append
+    # the current spot as the close of the still-forming candle.
+    closes_with_live = np.append(out["close"].to_numpy(), spot)
+    k_series, d_series = stoch_rsi_k(closes_with_live)
     k_now = float(k_series.iloc[-1]) if not pd.isna(k_series.iloc[-1]) else None
     d_now = float(d_series.iloc[-1]) if not pd.isna(d_series.iloc[-1]) else None
+
+    # Also keep the closed-bar value for reference (what TradingView shows at bar close)
+    k_closed_series, _ = stoch_rsi_k(out["close"].to_numpy())
+    k_closed = float(k_closed_series.iloc[-1]) if not pd.isna(k_closed_series.iloc[-1]) else None
 
     # Find historical flips for diagnostic display
     diffs = out["direction"].diff()
@@ -272,8 +280,9 @@ def analyze(symbol, resolution):
         "direction":     int(last["direction"]),
         "bars_loaded":   len(df),
         "flip_history":  flip_history,
-        "stoch_k":       k_now,
+        "stoch_k":       k_now,        # LIVE — updates every refresh
         "stoch_d":       d_now,
+        "stoch_k_closed": k_closed,    # closed-bar value (changes only at bar close)
     }
 
 
@@ -650,9 +659,10 @@ for i, sym in enumerate(SYMBOLS):
             delta=f"{DIR_EMOJI[s['direction']]}",
         )
         st.caption(f"Last bar close: ${s['bar_close']:,.2f}  ·  {to_ist_str(s['bar_time'])}")
-        # Live StochRSI %K
-        k_val = s.get("stoch_k")
-        d_val = s.get("stoch_d")
+        # Live StochRSI %K (updates every refresh using current spot)
+        k_val        = s.get("stoch_k")
+        k_closed_val = s.get("stoch_k_closed")
+        d_val        = s.get("stoch_d")
         if k_val is not None:
             # Color hint: highlight when at extremes
             if k_val < STOCHRSI_LONG_THRESHOLD:
@@ -661,8 +671,9 @@ for i, sym in enumerate(SYMBOLS):
                 k_color = "🟠"  # overbought (SHORT gate)
             else:
                 k_color = "⚪"
-            d_str = f"%D={d_val:.2f}" if d_val is not None else ""
-            st.caption(f"StochRSI: {k_color} %K=**{k_val:.2f}**  {d_str}")
+            closed_str = f" · last close: {k_closed_val:.2f}" if k_closed_val is not None else ""
+            d_str = f" · %D={d_val:.2f}" if d_val is not None else ""
+            st.caption(f"StochRSI: {k_color} **%K={k_val:.2f}** (live){d_str}{closed_str}")
 
 
 # ─── Pending orders (waiting for time + StochRSI gate) ──────────────────────
