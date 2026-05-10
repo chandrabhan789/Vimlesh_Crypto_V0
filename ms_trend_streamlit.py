@@ -36,15 +36,29 @@ from datetime import datetime, timezone, timedelta
 # ═════════════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
-SYMBOLS         = ["BTCUSD", "ETHUSD"]
-RESOLUTION      = "15m"
-REFRESH_SECONDS = 5
-LOOKBACK_BARS   = 3000   # enough history for indicator state to converge to TradingView's value
+SYMBOLS                = ["BTCUSD", "ETHUSD"]
+DEFAULT_RESOLUTION     = "15m"   # changeable in UI
+DEFAULT_REFRESH_SEC    = 10      # changeable in UI
+LOOKBACK_BARS          = 3000
 
 MS_LEN           = 10
 ATR_LENGTH       = 14
 ATR_MULT         = 4.0
 TARGET_STEP_MULT = 2.0
+
+# Stochastic RSI defaults (TradingView standard)
+RSI_LEN     = 14
+STOCH_LEN   = 14
+K_SMOOTH    = 3
+D_SMOOTH    = 3
+
+# Order-execution rule:
+#   After a flip, wait at least this many seconds, then start checking StochRSI %K.
+#   For LONG : execute when %K  <  STOCHRSI_LONG_THRESHOLD
+#   For SHORT: execute when %K  >  STOCHRSI_SHORT_THRESHOLD
+EXECUTION_WAIT_SECONDS    = 15 * 60   # 15 minutes
+STOCHRSI_LONG_THRESHOLD   = 5
+STOCHRSI_SHORT_THRESHOLD  = 80
 
 # Per-symbol simulated trade rules (in price points) — these are the DEFAULTS.
 # Live values are stored in st.session_state.trade_rules so they can be edited from the UI.
@@ -182,15 +196,62 @@ def ms_trend_matrix(df, ms_len=MS_LEN, atr_length=ATR_LENGTH,
     return df
 
 
-def analyze(symbol):
-    df = fetch_candles(symbol, RESOLUTION, LOOKBACK_BARS)
-    sec = RES_SECONDS[RESOLUTION]
+def stoch_rsi_k(close: np.ndarray,
+                rsi_len: int = RSI_LEN,
+                stoch_len: int = STOCH_LEN,
+                k_smooth: int = K_SMOOTH,
+                d_smooth: int = D_SMOOTH):
+    """
+    Standard TradingView Stochastic RSI.
+    Returns (k_series, d_series) — both 0..100 percentages.
+    Uses Wilder's RMA for the underlying RSI to match TradingView exactly.
+    """
+    close_s = pd.Series(close)
+    delta = close_s.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    # Wilder's RMA (matches Pine ta.rsi)
+    avg_gain = gain.ewm(alpha=1.0 / rsi_len, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / rsi_len, adjust=False).mean()
+
+    # RSI handling Pine's edge cases:
+    #   avg_loss == 0  → RSI = 100 (no losses, max bullish)
+    #   avg_gain == 0  → RSI = 0   (no gains, max bearish)
+    rs  = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    rsi = rsi.where(avg_gain != 0, 0.0)
+    rsi = rsi.fillna(50)  # before enough data, neutral
+
+    # Stochastic of RSI
+    rsi_min = rsi.rolling(stoch_len).min()
+    rsi_max = rsi.rolling(stoch_len).max()
+    denom = (rsi_max - rsi_min)
+    # When the RSI is flat across the window, use the RSI value itself as the stoch
+    # (this preserves overbought/oversold info: flat-at-100 → stoch=100, flat-at-0 → 0)
+    stoch = pd.Series(np.where(denom > 0, 100 * (rsi - rsi_min) / denom, rsi),
+                      index=rsi.index)
+
+    k = stoch.rolling(k_smooth).mean()
+    d = k.rolling(d_smooth).mean()
+    return k, d
+
+
+def analyze(symbol, resolution):
+    df = fetch_candles(symbol, resolution, LOOKBACK_BARS)
+    sec = RES_SECONDS[resolution]
     df["closes_at"] = df["time"] + pd.Timedelta(seconds=sec)
     df = df[df["closes_at"] <= datetime.now(timezone.utc)].drop(columns=["closes_at"]).reset_index(drop=True)
 
     out = ms_trend_matrix(df)
     last = out.iloc[-1]
     spot = fetch_spot_price(symbol)
+
+    # Stochastic RSI on the same closed-bar series
+    k_series, d_series = stoch_rsi_k(out["close"].to_numpy())
+    k_now = float(k_series.iloc[-1]) if not pd.isna(k_series.iloc[-1]) else None
+    d_now = float(d_series.iloc[-1]) if not pd.isna(d_series.iloc[-1]) else None
 
     # Find historical flips for diagnostic display
     diffs = out["direction"].diff()
@@ -211,6 +272,8 @@ def analyze(symbol):
         "direction":     int(last["direction"]),
         "bars_loaded":   len(df),
         "flip_history":  flip_history,
+        "stoch_k":       k_now,
+        "stoch_d":       d_now,
     }
 
 
@@ -313,9 +376,6 @@ def append_trade_csv(trade):
 # ═════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="MS Trend Matrix Bot", page_icon="📈", layout="wide")
 
-# Auto-refresh — works correctly on Streamlit Cloud (no worker-blocking)
-st_autorefresh(interval=REFRESH_SECONDS * 1000, key="auto_refresh")
-
 # Initialize session state
 if "trades"           not in st.session_state: st.session_state.trades = []
 if "prev_direction"   not in st.session_state: st.session_state.prev_direction = {s: None for s in SYMBOLS}
@@ -327,10 +387,19 @@ if "current_state"    not in st.session_state: st.session_state.current_state = 
 if "trade_rules"      not in st.session_state: st.session_state.trade_rules = {
     s: dict(DEFAULT_TRADE_RULES[s]) for s in SYMBOLS
 }
+# Pending orders waiting for the StochRSI gate.
+# Each is {symbol, direction, flip_time, flip_spot, executed: bool, cancelled: bool, signal_id}
+if "pending_orders"   not in st.session_state: st.session_state.pending_orders = {s: None for s in SYMBOLS}
+# Counter to give every flip a unique ID so each one fires at most one order
+if "next_signal_id"   not in st.session_state: st.session_state.next_signal_id = 1
+if "executed_signal_ids" not in st.session_state: st.session_state.executed_signal_ids = set()
+
+# UI-controlled settings
+if "ui_resolution"    not in st.session_state: st.session_state.ui_resolution = DEFAULT_RESOLUTION
+if "ui_refresh"       not in st.session_state: st.session_state.ui_refresh    = DEFAULT_REFRESH_SEC
 
 # Header
 st.title("📈 MS Trend Matrix [BigBeluga] — Live Signal Tracker")
-st.caption(f"Delta Exchange India  •  {RESOLUTION} bars  •  auto-refresh every {REFRESH_SECONDS}s")
 
 # Cloud-specific warnings
 if ON_CLOUD:
@@ -345,9 +414,36 @@ if ON_CLOUD:
 # Sidebar — controls & rules
 with st.sidebar:
     st.header("⚙️ Settings")
-    st.markdown(f"**Refresh interval:** {REFRESH_SECONDS}s")
-    st.markdown(f"**Timeframe:** {RESOLUTION}")
+    # Timeframe selector
+    tf_options = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "1d"]
+    tf_idx = tf_options.index(st.session_state.ui_resolution) if st.session_state.ui_resolution in tf_options else 3
+    st.session_state.ui_resolution = st.selectbox(
+        "Candle timeframe",
+        tf_options,
+        index=tf_idx,
+        help="Bar size used for the MS Trend Matrix indicator and StochRSI.",
+    )
+
+    # Refresh-rate selector
+    st.session_state.ui_refresh = st.number_input(
+        "Refresh interval (seconds)",
+        min_value=2, max_value=300,
+        value=int(st.session_state.ui_refresh),
+        step=1,
+        help="How often to poll Delta India and re-evaluate signals/StochRSI.",
+    )
+
     st.markdown(f"**Symbols:** {', '.join(SYMBOLS)}")
+    st.markdown(f"**StochRSI:** RSI={RSI_LEN}, Stoch={STOCH_LEN}, K={K_SMOOTH}, D={D_SMOOTH}")
+
+    st.divider()
+    st.subheader("🚦 Order-execution rule")
+    st.caption(
+        f"After a flip, wait **{EXECUTION_WAIT_SECONDS // 60} min**, then enter when:\n\n"
+        f"• LONG  signal + StochRSI %K **<** {STOCHRSI_LONG_THRESHOLD}\n\n"
+        f"• SHORT signal + StochRSI %K **>** {STOCHRSI_SHORT_THRESHOLD}\n\n"
+        "Each flip fires at most one order. New flip cancels any pending order."
+    )
 
     st.divider()
     st.subheader("📐 Trade rules (points)")
@@ -411,21 +507,28 @@ with st.sidebar:
         st.session_state.trades = []
         st.session_state.prev_direction = {s: None for s in SYMBOLS}
         st.session_state.open_trade = {s: None for s in SYMBOLS}
+        st.session_state.pending_orders = {s: None for s in SYMBOLS}
+        st.session_state.executed_signal_ids = set()
+        st.session_state.next_signal_id = 1
         st.session_state.baseline_set = False
         if os.path.exists(TRADES_CSV):
             os.remove(TRADES_CSV)
         st.success("Reset done.")
         st.rerun()
 
+# Auto-refresh — must come AFTER sidebar so we use the user's chosen interval
+st_autorefresh(interval=int(st.session_state.ui_refresh) * 1000, key="auto_refresh")
+
 
 # ─── Poll Delta India ────────────────────────────────────────────────────────
 state = {}
 errors = {}
 now_ist = datetime.now(IST)
+RESOLUTION = st.session_state.ui_resolution   # used by analyze()
 
 for sym in SYMBOLS:
     try:
-        state[sym] = analyze(sym)
+        state[sym] = analyze(sym, RESOLUTION)
     except Exception as e:
         errors[sym] = str(e)
 
@@ -434,18 +537,19 @@ st.session_state.errors = errors
 st.session_state.last_refresh = now_ist
 
 
-# ─── Update trades (TP/SL hits + flips) ─────────────────────────────────────
+# ─── Trade state machine: flips → pending orders → StochRSI gate → execute ──
 successes = 0
 for sym in SYMBOLS:
     if sym in errors:
         continue
     successes += 1
-    s = state[sym]
-    new_dir = s["direction"]
-    old_dir = st.session_state.prev_direction[sym]
-    spot    = s["spot"]
+    s        = state[sym]
+    new_dir  = s["direction"]
+    old_dir  = st.session_state.prev_direction[sym]
+    spot     = s["spot"]
+    stoch_k  = s["stoch_k"]   # may be None until enough warmup
 
-    # Step 1 — update any currently-open trade for this symbol with current spot
+    # Step 1 — update any currently-open (executed) trade with current spot
     open_t = st.session_state.open_trade[sym]
     if open_t is not None:
         update_open_trade(open_t, spot, now_ist)
@@ -453,21 +557,78 @@ for sym in SYMBOLS:
             append_trade_csv(open_t)
             st.session_state.open_trade[sym] = None  # closed
 
-    # Step 2 — handle direction flip (only after baseline is established)
+    # Step 2 — handle direction flip: cancel any pending order for this symbol,
+    # close any still-open executed trade as REVERSED, and create a NEW pending order.
     if old_dir is not None and new_dir != old_dir and new_dir in (1, -1):
-        # Close any still-open trade as REVERSED
+        # Cancel any pending order (it's now stale)
+        pend = st.session_state.pending_orders[sym]
+        if pend is not None and not pend["executed"] and not pend["cancelled"]:
+            pend["cancelled"]    = True
+            pend["cancel_time"]  = now_ist
+            pend["cancel_reason"] = f"Direction flipped to {DIR_NAME[new_dir]} before gate met"
+
+        # Close any executed-and-still-open trade as REVERSED
         open_t = st.session_state.open_trade[sym]
         if open_t is not None and open_t["status"] == "OPEN":
             close_trade_reversed(open_t, spot, now_ist)
             append_trade_csv(open_t)
             st.session_state.open_trade[sym] = None
 
-        # Open a fresh trade
-        new_trade = open_trade(sym, new_dir, spot, now_ist,
-                               st.session_state.trade_rules[sym])
-        if new_trade is not None:
-            st.session_state.trades.append(new_trade)
-            st.session_state.open_trade[sym] = new_trade
+        # Create a fresh pending order — will execute when the StochRSI gate is met
+        sig_id = st.session_state.next_signal_id
+        st.session_state.next_signal_id += 1
+        st.session_state.pending_orders[sym] = {
+            "signal_id":     sig_id,
+            "symbol":        sym,
+            "direction":     new_dir,
+            "flip_time":     now_ist,
+            "flip_spot":     spot,
+            "executed":      False,
+            "cancelled":     False,
+            "cancel_time":   None,
+            "cancel_reason": None,
+            "exec_time":     None,
+            "exec_spot":     None,
+            "exec_stoch_k":  None,
+        }
+
+    # Step 3 — for any pending order on this symbol, evaluate the gate every loop
+    pend = st.session_state.pending_orders[sym]
+    if pend is not None and not pend["executed"] and not pend["cancelled"]:
+        # Each signal_id can fire only one order, ever
+        if pend["signal_id"] in st.session_state.executed_signal_ids:
+            pend["cancelled"]    = True
+            pend["cancel_time"]  = now_ist
+            pend["cancel_reason"] = "Signal already executed (safety guard)"
+        else:
+            elapsed = (now_ist - pend["flip_time"]).total_seconds()
+            time_ok = elapsed >= EXECUTION_WAIT_SECONDS
+            still_same_direction = (new_dir == pend["direction"])
+
+            stoch_ok = False
+            if stoch_k is not None:
+                if pend["direction"] == 1:
+                    stoch_ok = stoch_k < STOCHRSI_LONG_THRESHOLD
+                elif pend["direction"] == -1:
+                    stoch_ok = stoch_k > STOCHRSI_SHORT_THRESHOLD
+
+            if time_ok and still_same_direction and stoch_ok:
+                # Fire the order — open a real (simulated) trade NOW at current spot
+                new_trade = open_trade(sym, pend["direction"], spot, now_ist,
+                                       st.session_state.trade_rules[sym])
+                if new_trade is not None:
+                    new_trade["signal_id"]     = pend["signal_id"]
+                    new_trade["flip_time"]     = pend["flip_time"]
+                    new_trade["flip_spot"]     = pend["flip_spot"]
+                    new_trade["exec_stoch_k"]  = stoch_k
+                    st.session_state.trades.append(new_trade)
+                    st.session_state.open_trade[sym] = new_trade
+
+                    pend["executed"]     = True
+                    pend["exec_time"]    = now_ist
+                    pend["exec_spot"]    = spot
+                    pend["exec_stoch_k"] = stoch_k
+                    st.session_state.executed_signal_ids.add(pend["signal_id"])
 
     st.session_state.prev_direction[sym] = new_dir
 
@@ -475,7 +636,7 @@ if not st.session_state.baseline_set and successes == len(SYMBOLS):
     st.session_state.baseline_set = True
 
 
-# ─── Top: Live spot prices + direction ───────────────────────────────────────
+# ─── Top: Live spot prices + direction + StochRSI %K ────────────────────────
 cols = st.columns(len(SYMBOLS))
 for i, sym in enumerate(SYMBOLS):
     with cols[i]:
@@ -489,6 +650,59 @@ for i, sym in enumerate(SYMBOLS):
             delta=f"{DIR_EMOJI[s['direction']]}",
         )
         st.caption(f"Last bar close: ${s['bar_close']:,.2f}  ·  {to_ist_str(s['bar_time'])}")
+        # Live StochRSI %K
+        k_val = s.get("stoch_k")
+        d_val = s.get("stoch_d")
+        if k_val is not None:
+            # Color hint: highlight when at extremes
+            if k_val < STOCHRSI_LONG_THRESHOLD:
+                k_color = "🔵"  # oversold (LONG gate)
+            elif k_val > STOCHRSI_SHORT_THRESHOLD:
+                k_color = "🟠"  # overbought (SHORT gate)
+            else:
+                k_color = "⚪"
+            d_str = f"%D={d_val:.2f}" if d_val is not None else ""
+            st.caption(f"StochRSI: {k_color} %K=**{k_val:.2f}**  {d_str}")
+
+
+# ─── Pending orders (waiting for time + StochRSI gate) ──────────────────────
+pendings = [p for p in st.session_state.pending_orders.values()
+            if p is not None and not p["executed"] and not p["cancelled"]]
+if pendings:
+    st.subheader("⏳ Pending orders (waiting for time + StochRSI gate)")
+    rows = []
+    for p in pendings:
+        sym = p["symbol"]
+        s = state.get(sym, {})
+        cur_k   = s.get("stoch_k")
+        cur_dir = s.get("direction")
+        elapsed = (now_ist - p["flip_time"]).total_seconds()
+        time_ok = elapsed >= EXECUTION_WAIT_SECONDS
+        time_remaining = max(0, EXECUTION_WAIT_SECONDS - int(elapsed))
+        still_same = (cur_dir == p["direction"])
+
+        if p["direction"] == 1:
+            gate_target = f"%K < {STOCHRSI_LONG_THRESHOLD}"
+            stoch_ok = cur_k is not None and cur_k < STOCHRSI_LONG_THRESHOLD
+        else:
+            gate_target = f"%K > {STOCHRSI_SHORT_THRESHOLD}"
+            stoch_ok = cur_k is not None and cur_k > STOCHRSI_SHORT_THRESHOLD
+
+        gates = []
+        gates.append("✅ time" if time_ok else f"⏳ time ({time_remaining // 60}m {time_remaining % 60}s left)")
+        gates.append("✅ direction" if still_same else "❌ direction (will cancel)")
+        gates.append("✅ stochrsi" if stoch_ok else f"⏳ stochrsi ({gate_target})")
+
+        rows.append({
+            "Symbol":      sym,
+            "Side":        DIR_NAME[p["direction"]],
+            "Flip time":   to_ist_str(p["flip_time"]),
+            "Flip spot":   round(p["flip_spot"], 2),
+            "Current %K":  f"{cur_k:.2f}" if cur_k is not None else "—",
+            "Gate target": gate_target,
+            "Status":      "  •  ".join(gates),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
 # ─── Live open-trade monitor (TP/SL distance from current spot) ─────────────
