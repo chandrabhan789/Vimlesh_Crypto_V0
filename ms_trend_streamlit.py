@@ -403,6 +403,21 @@ if "pending_orders"   not in st.session_state: st.session_state.pending_orders =
 if "next_signal_id"   not in st.session_state: st.session_state.next_signal_id = 1
 if "executed_signal_ids" not in st.session_state: st.session_state.executed_signal_ids = set()
 
+# Event log — every meaningful thing that happens, ring-buffer of the last 200 entries.
+# Helps diagnose "things stopped working" issues without server logs.
+if "event_log"        not in st.session_state: st.session_state.event_log = []
+
+def log_event(level: str, message: str):
+    """Append an event to the in-memory ring buffer."""
+    st.session_state.event_log.append({
+        "time":    datetime.now(IST),
+        "level":   level,    # INFO, WARN, ERROR, FIRE, CLOSE
+        "message": message,
+    })
+    # Cap at 200 entries
+    if len(st.session_state.event_log) > 200:
+        st.session_state.event_log = st.session_state.event_log[-200:]
+
 # UI-controlled settings
 if "ui_resolution"    not in st.session_state: st.session_state.ui_resolution = DEFAULT_RESOLUTION
 if "ui_refresh"       not in st.session_state: st.session_state.ui_refresh    = DEFAULT_REFRESH_SEC
@@ -520,6 +535,7 @@ with st.sidebar:
         st.session_state.executed_signal_ids = set()
         st.session_state.next_signal_id = 1
         st.session_state.baseline_set = False
+        st.session_state.event_log = []
         if os.path.exists(TRADES_CSV):
             os.remove(TRADES_CSV)
         st.success("Reset done.")
@@ -540,6 +556,7 @@ for sym in SYMBOLS:
         state[sym] = analyze(sym, RESOLUTION)
     except Exception as e:
         errors[sym] = str(e)
+        log_event("ERROR", f"{sym}: poll failed — {str(e)[:200]}")
 
 st.session_state.current_state = state
 st.session_state.errors = errors
@@ -564,17 +581,24 @@ for sym in SYMBOLS:
         update_open_trade(open_t, spot, now_ist)
         if open_t["status"] in ("WIN", "LOSS"):
             append_trade_csv(open_t)
+            log_event("CLOSE",
+                f"{sym}: trade closed {open_t['status']} — "
+                f"{DIR_NAME[open_t['direction']]} @ entry ${open_t['entry']:,.2f}, "
+                f"exit ${open_t['exit_price']:,.2f}, P&L {open_t['pnl_points']:+.2f} pts")
             st.session_state.open_trade[sym] = None  # closed
 
     # Step 2 — handle direction flip: cancel any pending order for this symbol,
     # close any still-open executed trade as REVERSED, and create a NEW pending order.
     if old_dir is not None and new_dir != old_dir and new_dir in (1, -1):
+        log_event("INFO", f"{sym}: FLIP detected {DIR_NAME.get(old_dir, '?')} → {DIR_NAME[new_dir]} @ ${spot:,.2f}")
+
         # Cancel any pending order (it's now stale)
         pend = st.session_state.pending_orders[sym]
         if pend is not None and not pend["executed"] and not pend["cancelled"]:
             pend["cancelled"]    = True
             pend["cancel_time"]  = now_ist
             pend["cancel_reason"] = f"Direction flipped to {DIR_NAME[new_dir]} before gate met"
+            log_event("WARN", f"{sym}: pending {DIR_NAME[pend['direction']]} CANCELLED (direction flipped before gate)")
 
         # Close any executed-and-still-open trade as REVERSED
         open_t = st.session_state.open_trade[sym]
@@ -638,6 +662,12 @@ for sym in SYMBOLS:
                     pend["exec_spot"]    = spot
                     pend["exec_stoch_k"] = stoch_k
                     st.session_state.executed_signal_ids.add(pend["signal_id"])
+
+                    log_event("FIRE",
+                        f"{sym}: 🚨 ORDER FIRED — {DIR_NAME[pend['direction']]} "
+                        f"@ ${spot:,.2f}  (entry=${new_trade['entry']:,.2f}, "
+                        f"target=${new_trade['target']:,.2f}, stop=${new_trade['stop']:,.2f}, "
+                        f"%K={stoch_k:.2f})")
 
     st.session_state.prev_direction[sym] = new_dir
 
@@ -860,6 +890,76 @@ else:
         return ""
     styled = log_df.style.map(color_status, subset=["Status"])
     st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
+# ─── System Health & Event Log (diagnostic) ─────────────────────────────────
+st.divider()
+st.subheader("🩺 System Health")
+
+hc1, hc2, hc3, hc4 = st.columns(4)
+hc1.metric("Last refresh", to_ist_str(now_ist).replace(" IST", ""))
+hc2.metric("Total trades",   len(st.session_state.trades))
+hc3.metric("Pending orders", sum(1 for p in st.session_state.pending_orders.values()
+                                 if p is not None and not p["executed"] and not p["cancelled"]))
+hc4.metric("Errors this poll", len(errors))
+
+# Current per-symbol state
+health_rows = []
+for sym in SYMBOLS:
+    if sym in errors:
+        health_rows.append({
+            "Symbol":     sym,
+            "Status":     "❌ ERROR",
+            "Spot":       "—",
+            "Direction":  "—",
+            "Live %K":    "—",
+            "Pending":    "—",
+            "Open trade": "—",
+            "Last error": errors[sym][:80],
+        })
+    else:
+        s = state[sym]
+        pend = st.session_state.pending_orders[sym]
+        if pend is None:
+            pend_str = "none"
+        elif pend["cancelled"]:
+            pend_str = f"❌ cancelled ({pend.get('cancel_reason', '?')[:40]})"
+        elif pend["executed"]:
+            pend_str = f"✅ executed @ {to_ist_str(pend['exec_time'])}"
+        else:
+            elapsed = int((now_ist - pend["flip_time"]).total_seconds())
+            pend_str = f"⏳ {DIR_NAME[pend['direction']]} waiting ({elapsed // 60}m {elapsed % 60}s elapsed)"
+
+        ot = st.session_state.open_trade[sym]
+        ot_str = f"{DIR_NAME[ot['direction']]} @ ${ot['entry']:,.2f}" if ot else "none"
+        k_val = s.get("stoch_k")
+        health_rows.append({
+            "Symbol":     sym,
+            "Status":     "✅ OK",
+            "Spot":       f"${s['spot']:,.2f}",
+            "Direction":  DIR_EMOJI[s["direction"]],
+            "Live %K":    f"{k_val:.2f}" if k_val is not None else "—",
+            "Pending":    pend_str,
+            "Open trade": ot_str,
+            "Last error": "",
+        })
+st.dataframe(pd.DataFrame(health_rows), hide_index=True, use_container_width=True)
+
+# Event log
+with st.expander(f"📜 Event log ({len(st.session_state.event_log)} events)", expanded=False):
+    if not st.session_state.event_log:
+        st.info("No events recorded yet.")
+    else:
+        # Newest first, last 50
+        recent = list(reversed(st.session_state.event_log))[:50]
+        log_rows = []
+        for ev in recent:
+            log_rows.append({
+                "Time":    to_ist_str(ev["time"]),
+                "Level":   ev["level"],
+                "Message": ev["message"],
+            })
+        st.dataframe(pd.DataFrame(log_rows), hide_index=True, use_container_width=True)
 
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
