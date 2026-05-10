@@ -39,7 +39,7 @@ from datetime import datetime, timezone, timedelta
 SYMBOLS         = ["BTCUSD", "ETHUSD"]
 RESOLUTION      = "15m"
 REFRESH_SECONDS = 5
-LOOKBACK_BARS   = 500
+LOOKBACK_BARS   = 3000   # enough history for indicator state to converge to TradingView's value
 
 MS_LEN           = 10
 ATR_LENGTH       = 14
@@ -183,12 +183,26 @@ def analyze(symbol):
     out = ms_trend_matrix(df)
     last = out.iloc[-1]
     spot = fetch_spot_price(symbol)
+
+    # Find historical flips for diagnostic display
+    diffs = out["direction"].diff()
+    flip_rows = out[diffs != 0].iloc[1:]   # skip very first row (NaN diff)
+    flip_history = []
+    for _, r in flip_rows.tail(10).iterrows():
+        flip_history.append({
+            "time":      r["time"],
+            "direction": int(r["direction"]),
+            "close":     float(r["close"]),
+        })
+
     return {
-        "symbol":    symbol,
-        "spot":      spot,
-        "bar_time":  last["time"],
-        "bar_close": float(last["close"]),
-        "direction": int(last["direction"]),
+        "symbol":        symbol,
+        "spot":          spot,
+        "bar_time":      last["time"],
+        "bar_close":     float(last["close"]),
+        "direction":     int(last["direction"]),
+        "bars_loaded":   len(df),
+        "flip_history":  flip_history,
     }
 
 
@@ -444,6 +458,36 @@ for i, sym in enumerate(SYMBOLS):
             delta=f"{DIR_EMOJI[s['direction']]}",
         )
         st.caption(f"Last bar close: ${s['bar_close']:,.2f}  ·  {to_ist_str(s['bar_time'])}")
+
+
+# ─── Diagnostic: recent flips per symbol (cross-check against TradingView) ───
+with st.expander("🔍 Diagnostics — recent flips in loaded history (compare with TradingView)"):
+    st.caption(
+        f"Loaded **{LOOKBACK_BARS}** bars per symbol. The last 10 direction "
+        f"changes the indicator detected are shown below — they should match "
+        f"the ChoCh ↑ / ChoCh ↓ markers on your TradingView chart. "
+        f"If they don't, increase LOOKBACK_BARS in the code."
+    )
+    diag_cols = st.columns(len(SYMBOLS))
+    for i, sym in enumerate(SYMBOLS):
+        with diag_cols[i]:
+            st.markdown(f"**{sym}**")
+            if sym in errors:
+                st.warning(errors[sym])
+                continue
+            s = state[sym]
+            st.caption(f"Bars actually loaded (closed only): {s['bars_loaded']}")
+            if not s["flip_history"]:
+                st.info("No flips found in loaded history — try increasing LOOKBACK_BARS.")
+            else:
+                hist_rows = []
+                for h in s["flip_history"]:
+                    hist_rows.append({
+                        "Time (IST)": to_ist_str(h["time"]),
+                        "Flipped to": DIR_EMOJI[h["direction"]],
+                        "Close":      f"${h['close']:,.2f}",
+                    })
+                st.dataframe(pd.DataFrame(hist_rows), hide_index=True, use_container_width=True)
 
 
 # ─── Status bar ──────────────────────────────────────────────────────────────
