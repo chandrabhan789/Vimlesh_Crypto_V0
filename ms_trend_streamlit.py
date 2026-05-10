@@ -568,7 +568,7 @@ else:
         if val == "OPEN":     return "background-color: #1f4e8a; color: white"
         if val == "REVERSED": return "background-color: #6e6020; color: white"
         return ""
-    styled = log_df.style.applymap(color_status, subset=["Status"])
+    styled = log_df.style.map(color_status, subset=["Status"])
     st.dataframe(styled, hide_index=True, use_container_width=True)
 
 
